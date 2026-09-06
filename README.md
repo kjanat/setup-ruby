@@ -136,6 +136,35 @@ See the GitHub Actions documentation for more details about the
 [workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
 and the [condition and expression syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).
 
+### PATH in later steps
+
+The selected Ruby is added to `PATH` for later steps in the job.
+The action also removes existing PATH entries containing the word `ruby` (case-insensitive).
+This avoids finding commands from an older Ruby installation when the selected installation
+does not provide them, such as `bundle`, `rake`, or other gem commands.
+The directories and their files are not deleted.
+
+These changes use two GitHub Actions mechanisms:
+
+* `GITHUB_ENV` sets `PATH` to the existing list with those entries removed.
+* `GITHUB_PATH` adds the selected Ruby directories to the front of the search list.
+
+Before starting each later action or shell step, the runner prepends its `GITHUB_PATH`
+entries to the PATH value in the step's environment. This gives the selected Ruby priority
+while retaining the other entries in that value. Later additions through `GITHUB_PATH`
+also take effect. The PATH printed in a step's log header can omit these additions;
+inspect PATH inside the running step to see the effective value.
+See GitHub's documentation on [environment variables](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-environment-variable)
+and [adding to PATH](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#adding-a-system-path).
+
+The cleanup cannot remove entries that an earlier step added through `GITHUB_PATH`:
+the runner remembers those separately and adds them back for later steps.
+For example, after switching Ruby versions with two setup-ruby calls in one job,
+`ruby` uses the newly selected version, but a gem command installed only under the
+earlier version can still be found and run with that earlier Ruby.
+Use separate [matrix jobs](#matrix-of-ruby-versions) to test different Ruby versions
+without sharing this PATH state.
+
 ### Supported Version Syntax
 
 * engine-version like `ruby-2.6.5` and `truffleruby-19.3.0`

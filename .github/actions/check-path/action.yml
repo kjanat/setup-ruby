@@ -1,0 +1,3 @@
+name: Check the effective PATH
+description: Verify Ruby and unrelated tools in a later JavaScript action
+runs: { using: node24, main: index.mjs }

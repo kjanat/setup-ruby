@@ -1,0 +1,129 @@
+name: Test PATH in later steps
+on:
+  pull_request: null
+  push: { branches-ignore: [v1] }
+  workflow_dispatch: null
+permissions: { contents: read }
+defaults: { run: { shell: pwsh } }
+jobs:
+  path:
+    name: PATH (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Add an old Ruby entry and unrelated tools
+        run: |
+          $PSDefaultParameterValues['*:Encoding'] = 'utf8NoBOM'
+          foreach ($tool in @('old', 'inherited', 'before', 'after')) {
+            $name     = $tool -eq 'old' ? 'old-ruby' : "$tool-tool"
+            $dir      = Join-Path $env:RUNNER_TEMP "path-test/$name/bin"
+            $toolPath = Join-Path $dir "path-test-$tool"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+
+            if ($IsWindows) {
+              $toolPath += '.cmd'
+              Set-Content $toolPath "@echo $tool" -Encoding ascii
+            } else {
+              Set-Content $toolPath "#!/bin/sh`necho $tool"
+              chmod +x $toolPath
+              if ($LASTEXITCODE) { '::error::Could not make the test tool executable'; exit 1 }
+            }
+            $testEnv = "PATH_TEST_{0}={1}" -f $tool.ToUpper(), $dir
+            Add-Content -Path $env:GITHUB_ENV -Value $testEnv
+          }
+          $old       = Join-Path $env:RUNNER_TEMP 'path-test/old-ruby/bin'
+          $before    = Join-Path $env:RUNNER_TEMP 'path-test/before-tool/bin'
+          $inherited = Join-Path $env:RUNNER_TEMP 'path-test/inherited-tool/bin'
+          $testPath  = 'PATH={0}' -f (@($old, $inherited, $env:PATH) -join [IO.Path]::PathSeparator)
+
+          Add-Content -Path $env:GITHUB_ENV  -Value $testPath
+          Add-Content -Path $env:GITHUB_PATH -Value $before
+
+      - uses: ./
+        id: ruby
+        with: { ruby-version: "3.4", bundler: none }
+
+      - name: Check the next shell step
+        id: shell-before
+        env:
+          EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}"
+          TOOLS: "inherited,before"
+        run: &check-path |
+          $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
+          $tools      = $env:TOOLS -split ','
+          try {
+            $dirs = $env:PATH -split [IO.Path]::PathSeparator
+            if ($dirs -contains $env:PATH_TEST_OLD)                      { throw 'Old Ruby entry remains on PATH'     }
+            if (Get-Command path-test-old -ErrorAction SilentlyContinue) { throw 'Old gem command can still be found' }
+
+            foreach ($tool in $tools) {
+              $dir    = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
+              $count  = @($dirs | Where-Object { $_ -eq $dir }).Count
+              if ($count -ne 1) { throw "$tool tool entry occurs $count times on PATH" }
+              $output = &"path-test-$tool"
+              if ($LASTEXITCODE -or ($output -ne $tool)) { throw "$tool tool did not run correctly"      }
+            }
+            $ruby = ruby -rjson -rrbconfig -e 'puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)'
+            if ($LASTEXITCODE) { throw 'Ruby failed to run' }
+
+            $actual     = ConvertFrom-Json $ruby
+            $executable = $IsWindows ? 'ruby.exe' : 'ruby'
+            $expected   = Join-Path $env:EXPECTED_RUBY_PREFIX "bin/$executable"
+            if (
+              ([IO.Path]::GetFullPath($actual.executable) -ne [IO.Path]::GetFullPath($expected)) -or
+              $actual.version -notmatch '^3\.4\.'
+            ) { throw "Unexpected Ruby: {0}" -f $ruby }
+            "Ruby: {0}`nPATH: {1}" -f $ruby, $env:PATH
+            '::notice title=PATH check passed::Selected Ruby and unrelated tools are available in the shell step'
+          } catch { "::error title=PATH check failed::$(&$escapeData($_.Exception.Message))"; exit 1 }
+
+      - name: Check a later JavaScript action
+        id: action-before
+        if: ${{ !cancelled() && steps.ruby.outcome == 'success' }}
+        uses: $/.github/actions/check-path
+        env: { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
+
+      - name: Add another tool for later steps
+        id: add-tool
+        if: ${{ !cancelled() && steps.ruby.outcome == 'success' }}
+        run: |
+          $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
+          Add-Content -Path $env:GITHUB_PATH -Value $env:PATH_TEST_AFTER
+          Add-Content -Path $env:GITHUB_ENV  -Value 'PATH_TEST_AFTER_ADDED=true'
+
+      - name: Check a shell step after the PATH addition
+        id: shell-after
+        if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
+        env:
+          EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}"
+          TOOLS: "inherited,before,after"
+        run: *check-path
+
+      - name: Check a JavaScript action after the PATH addition
+        id: action-after
+        if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
+        uses: $/.github/actions/check-path
+        env: { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
+
+      - name: Summarize PATH checks
+        if: always()
+        env: { JOB_STATUS: "${{ job.status }}", STEPS: "${{ toJSON(steps) }}" }
+        run: |
+          $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
+          $steps = $env:STEPS | ConvertFrom-Json
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+          ### PATH checks: $env:JOB_STATUS
+
+          Each check verifies that Ruby 3.4 runs, the old Ruby PATH entry is removed, and unrelated tool entries occur exactly once on PATH and remain usable.
+
+          | Check                                         | Result                            |
+          | --------------------------------------------- | --------------------------------- |
+          | Shell after setup-ruby                        | $($steps.'shell-before'.outcome)  |
+          | JavaScript action after setup-ruby            | $($steps.'action-before'.outcome) |
+          | Shell after another PATH addition             | $($steps.'shell-after'.outcome)   |
+          | JavaScript action after another PATH addition | $($steps.'action-after'.outcome)  |
+          "@
