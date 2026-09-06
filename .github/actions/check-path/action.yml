@@ -1,3 +1,4 @@
 name: Check the effective PATH
 description: Verify Ruby and unrelated tools in a later JavaScript action
+outputs: { diagnostic: { description: "JSON-encoded observation or failure message" } }
 runs: { using: node24, main: index.mjs }

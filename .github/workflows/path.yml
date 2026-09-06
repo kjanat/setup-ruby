@@ -9,6 +9,7 @@ jobs:
   path:
     name: PATH (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env: { RUNNER_LABEL: "${{ matrix.os }}" }
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -47,14 +48,18 @@ jobs:
         id: ruby
         with: { ruby-version: "3.4", bundler: none }
 
-      - name: Check the next shell step
+      - name: PowerShell / after setup-ruby
         id: shell-before
         env:
           EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}"
           TOOLS: "inherited,before"
         run: &check-path |
           $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
-          $tools      = $env:TOOLS -split ','
+          $phase = $env:PATH_TEST_AFTER_ADDED -eq 'true' ? 'after later PATH addition' : 'after setup-ruby'
+          $title = (&$escapeData "$env:RUNNER_LABEL / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
+          $tools = $env:TOOLS -split ','
+          $toolCounts = @()
+          $diagnostic = ''
           try {
             $dirs = $env:PATH -split [IO.Path]::PathSeparator
             if ($dirs -contains $env:PATH_TEST_OLD)                      { throw 'Old Ruby entry remains on PATH'     }
@@ -63,14 +68,13 @@ jobs:
             foreach ($tool in $tools) {
               $dir = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
               $matchingEntries = @(for ($i = 0; $i -lt $dirs.Count; $i++) {
-                if ($dirs[$i] -eq $dir) { "PATH[$($i + 1)]: $($dirs[$i])" }
+                if ($dirs[$i] -eq $dir) { "Entry $($i + 1): $($dirs[$i])" }
               })
+              $toolCounts += "$tool-tool=$($matchingEntries.Count)"
               if ($matchingEntries.Count -ne 1) {
-                $details = $matchingEntries.Count ? ($matchingEntries -join "`n") : '(none)'
+                $details = $matchingEntries.Count ? ($matchingEntries -join "`n") : "Missing: $dir"
                 throw (@(
-                  "$tool tool entry occurs $($matchingEntries.Count) times on PATH (expected 1)."
-                  "Expected directory: $dir"
-                  'Matching PATH entries (positions start at 1):'
+                  "$tool-tool: expected 1 PATH entry, found $($matchingEntries.Count)."
                   $details
                 ) -join "`n")
               }
@@ -87,11 +91,19 @@ jobs:
               ([IO.Path]::GetFullPath($actual.executable) -ne [IO.Path]::GetFullPath($expected)) -or
               $actual.version -notmatch '^3\.4\.'
             ) { throw "Unexpected Ruby: {0}" -f $ruby }
+            $diagnostic = "Ruby $($actual.version); PATH entries: $($toolCounts -join ', ').`nInterpreter: $($actual.executable)"
             "Ruby: {0}`nPATH: {1}" -f $ruby, $env:PATH
-            '::notice title=PATH check passed::Selected Ruby and unrelated tools are available in the shell step'
-          } catch { "::error title=PATH check failed::$(&$escapeData($_.Exception.Message))"; exit 1 }
+            "::notice title=$($title)::PATH checks passed."
+          } catch {
+            $diagnostic = $_.Exception.Message
+            "::error title=$($title)::$(&$escapeData $diagnostic)"
+            exit 1
+          } finally {
+            $json = ConvertTo-Json -InputObject $diagnostic -Compress
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "diagnostic=$json" -Encoding utf8NoBOM
+          }
 
-      - name: Check a later JavaScript action
+      - name: JavaScript / after setup-ruby
         id: action-before
         if: ${{ !cancelled() && steps.ruby.outcome == 'success' }}
         uses: $/.github/actions/check-path
@@ -105,7 +117,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $env:PATH_TEST_AFTER
           Add-Content -Path $env:GITHUB_ENV  -Value 'PATH_TEST_AFTER_ADDED=true'
 
-      - name: Check a shell step after the PATH addition
+      - name: PowerShell / after later PATH addition
         id: shell-after
         if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
         env:
@@ -113,7 +125,7 @@ jobs:
           TOOLS: "inherited,before,after"
         run: *check-path
 
-      - name: Check a JavaScript action after the PATH addition
+      - name: JavaScript / after later PATH addition
         id: action-after
         if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
         uses: $/.github/actions/check-path
@@ -125,15 +137,34 @@ jobs:
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           $steps = $env:STEPS | ConvertFrom-Json
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
-          ### PATH checks: $env:JOB_STATUS
-
-          Each check verifies that Ruby 3.4 runs, the old Ruby PATH entry is removed, and unrelated tool entries occur exactly once on PATH and remain usable.
-
-          | Check                                         | Result                            |
-          | --------------------------------------------- | --------------------------------- |
-          | Shell after setup-ruby                        | $($steps.'shell-before'.outcome)  |
-          | JavaScript action after setup-ruby            | $($steps.'action-before'.outcome) |
-          | Shell after another PATH addition             | $($steps.'shell-after'.outcome)   |
-          | JavaScript action after another PATH addition | $($steps.'action-after'.outcome)  |
-          "@
+          $labels = [ordered]@{
+            'shell-before'  = 'PowerShell / after setup-ruby'
+            'action-before' = 'JavaScript / after setup-ruby'
+            'shell-after'   = 'PowerShell / after later PATH addition'
+            'action-after'  = 'JavaScript / after later PATH addition'
+          }
+          $lines = @(
+            "### $env:RUNNER_LABEL / PATH checks: $env:JOB_STATUS"
+            ''
+            '| Check | Result | Finding |'
+            '| --- | --- | --- |'
+          )
+          $details = @()
+          foreach ($id in $labels.Keys) {
+            $step = $steps.$id
+            $diagnostic = if ($step.outputs.diagnostic) {
+              $step.outputs.diagnostic | ConvertFrom-Json
+            } elseif ($step.outcome -eq 'skipped') {
+              'Not run.'
+            } else {
+              'No diagnostic recorded; see the step log.'
+            }
+            $parts = $diagnostic -split '\r?\n', 2
+            $finding = [Net.WebUtility]::HtmlEncode($parts[0]).Replace('|', '&#124;')
+            $lines += "| $($labels[$id]) | $($step.outcome) | $finding |"
+            if ($parts.Count -gt 1) {
+              $text = [Net.WebUtility]::HtmlEncode($diagnostic)
+              $details += @('', "<details><summary>$($labels[$id]) — details</summary>", '', "<pre>$text</pre>", '', '</details>')
+            }
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (($lines + $details) -join "`n")
