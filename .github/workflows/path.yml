@@ -136,12 +136,6 @@ jobs:
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           $steps = $env:STEPS | ConvertFrom-Json
-          $labels = [ordered]@{
-            'shell-before'  = 'PowerShell / after setup-ruby'
-            'action-before' = 'JavaScript / after setup-ruby'
-            'shell-after'   = 'PowerShell / after later PATH addition'
-            'action-after'  = 'JavaScript / after later PATH addition'
-          }
           $lines = @(
             "### $env:RUNNER_OS / PATH checks: $env:JOB_STATUS"
             ''
@@ -149,17 +143,17 @@ jobs:
             '| --- | --- | --- |'
           )
           $details = @()
-          switch -Wildcard ($labels.Keys) {
+          switch -Wildcard ($steps.PSObject.Properties.Name -match '^(shell|action)-') {
             { $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outputs.diagnostic | ConvertFrom-Json }
             { -not $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outcome -eq 'skipped' ? 'Not run.' : 'No diagnostic recorded; see the step log.' }
             '*' {
               $step = $steps.$_
               $parts = $diagnostic -split '\r?\n', 2
               $finding = [Net.WebUtility]::HtmlEncode($parts[0]).Replace('|', '&#124;')
-              $lines += "| $($labels[$_]) | $($step.outcome) | $finding |"
+              $lines += "| $_ | $($step.outcome) | $finding |"
               if ($parts.Count -gt 1) {
                 $text = [Net.WebUtility]::HtmlEncode($diagnostic)
-                $details += @('', "<details><summary>$($labels[$_]) — details</summary>", '', "<pre>$text</pre>", '', '</details>')
+                $details += @('', "<details><summary>$_ — details</summary>", '', "<pre>$text</pre>", '', '</details>')
               }
             }
           }
