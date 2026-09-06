@@ -12,7 +12,7 @@ try {
   assert.ok(!dirs.includes(normalize(process.env.PATH_TEST_OLD)), 'Old Ruby entry remains on PATH')
   const old = process.platform === 'win32'
     ? spawnSync('where.exe', ['path-test-old'], { encoding: 'utf8' })
-    : spawnSync('sh', ['-c', 'command -v path-test-old'], { encoding: 'utf8' })
+    : spawnSync('sh', ['-c', 'if command -v path-test-old; then exit 0; else exit 1; fi'], { encoding: 'utf8' })
   assert.ifError(old.error)
   assert.equal(old.status, 1, `Old command lookup should find nothing: ${old.stdout || old.stderr}`)
   const tools = ['inherited', 'before']
