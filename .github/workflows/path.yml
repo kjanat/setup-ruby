@@ -7,17 +7,26 @@ permissions: { contents: read }
 defaults: { run: { shell: pwsh } }
 jobs:
   path:
-    name: PATH (${{ matrix.os }})
+    name: PATH (${{ matrix.os }}, ${{ matrix.setup && 'with' || 'without' }} setup-ruby)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest], setup: [false, true] }
+    env: { SETUP_RUBY: "${{ matrix.setup }}" }
     steps:
       - uses: actions/checkout@v7
       - name: Add an old Ruby entry and unrelated tools
+        id: seed
         run: |
           $PSDefaultParameterValues['*:Encoding'] = 'utf8NoBOM'
+          $baseline = 'null'
+          if (Get-Command ruby -CommandType Application -ErrorAction SilentlyContinue) {
+            $baseline = ruby -rjson -rrbconfig -e 'puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)'
+            if ($LASTEXITCODE) { '::error::Could not record the initial Ruby'; exit 1 }
+            $baseline = $baseline | ConvertFrom-Json | ConvertTo-Json -Compress
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "BASELINE_RUBY=$baseline"
           foreach ($tool in @('old', 'inherited', 'before', 'after')) {
             $name     = $tool -eq 'old' ? 'old-ruby' : "$tool-tool"
             $dir      = Join-Path $env:RUNNER_TEMP "path-test/$name/bin"
@@ -45,72 +54,92 @@ jobs:
 
       - uses: ./
         id: ruby
+        if: matrix.setup
         with: { ruby-version: "3.4", bundler: none }
 
-      - name: PowerShell / after setup-ruby
+      - name: PowerShell / before later PATH addition
         id: shell-before
-        env:
-          EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}"
-          TOOLS: "inherited,before"
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        env: &check-env { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
         run: &check-path |
           $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
-          $phase = $env:PATH_TEST_AFTER_ADDED -eq 'true' ? 'after later PATH addition' : 'after setup-ruby'
-          $title = (&$escapeData "$env:RUNNER_OS / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
-          $tools = $env:TOOLS -split ','
-          $toolCounts = @()
-          $diagnostic = ''
-          try {
-            $dirs = $env:PATH -split [IO.Path]::PathSeparator
-            if ($dirs -contains $env:PATH_TEST_OLD)                      { throw 'Old Ruby entry remains on PATH'     }
-            if (Get-Command path-test-old -ErrorAction SilentlyContinue) { throw 'Old gem command can still be found' }
-
-            foreach ($tool in $tools) {
-              $dir = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
-              $matchingEntries = @(for ($i = 0; $i -lt $dirs.Count; $i++) {
-                if ($dirs[$i] -eq $dir) { "Entry $($i + 1): $($dirs[$i])" }
-              })
-              $toolCounts += "$tool-tool=$($matchingEntries.Count)"
-              if ($matchingEntries.Count -ne 1) {
-                $details = $matchingEntries.Count ? ($matchingEntries -join "`n") : "Missing: $dir"
-                throw (@(
-                  "$tool-tool: expected 1 PATH entry, found $($matchingEntries.Count)."
-                  $details
-                ) -join "`n")
-              }
-              $output = &"path-test-$tool"
-              if ($LASTEXITCODE -or ($output -ne $tool)) { throw "$tool tool did not run correctly"      }
-            }
-            $ruby = ruby -rjson -rrbconfig -e 'puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)'
-            if ($LASTEXITCODE) { throw 'Ruby failed to run' }
-
-            $actual     = ConvertFrom-Json $ruby
-            $executable = $IsWindows ? 'ruby.exe' : 'ruby'
-            $expected   = Join-Path $env:EXPECTED_RUBY_PREFIX "bin/$executable"
-            if (
-              ([IO.Path]::GetFullPath($actual.executable) -ne [IO.Path]::GetFullPath($expected)) -or
-              $actual.version -notmatch '^3\.4\.'
-            ) { throw "Unexpected Ruby: {0}" -f $ruby }
-            $diagnostic = "Ruby $($actual.version); PATH entries: $($toolCounts -join ', ').`nInterpreter: $($actual.executable)"
-            "Ruby: {0}`nPATH: {1}" -f $ruby, $env:PATH
-            "::notice title=$($title)::PATH checks passed."
-          } catch {
-            $diagnostic = $_.Exception.Message
-            "::error title=$($title)::$(&$escapeData $diagnostic)"
-            exit 1
-          } finally {
-            $json = ConvertTo-Json -InputObject $diagnostic -Compress
-            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "diagnostic=$json" -Encoding utf8NoBOM
+          $normalize = { param([string]$s)
+            $s = [IO.Path]::GetFullPath($s).TrimEnd('/', '\')
+            $IsWindows ? $s.ToLowerInvariant() : $s
           }
+          $setup = $env:SETUP_RUBY -eq 'true'
+          $case = $setup ? 'with setup-ruby' : 'without setup-ruby'
+          $phase = $env:PATH_TEST_AFTER_ADDED -eq 'true' ? 'after later PATH addition' : 'before later PATH addition'
+          $title = (&$escapeData "$env:RUNNER_OS / $case / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
+          $dirs = $env:PATH -split [IO.Path]::PathSeparator
+          $tools = @('old', 'inherited', 'before')
+          if ($env:PATH_TEST_AFTER_ADDED -eq 'true') { $tools += 'after' }
+          $observations = @()
+          $failures = @()
+          foreach ($tool in $tools) {
+            $observed = [ordered]@{ tool = $tool; entries = @(); command = $null; output = $null }
+            try {
+              $dir = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
+              $observed.entries = @(for ($i = 0; $i -lt $dirs.Count; $i++) {
+                if ($dirs[$i] -and (&$normalize $dirs[$i]) -ceq (&$normalize $dir)) {
+                  @{ position = $i + 1; directory = $dirs[$i] }
+                }
+              })
+              $command = Get-Command "path-test-$tool" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($command) {
+                $observed.command = $command.Source
+                $observed.output = (& $command.Source | Out-String).Trim()
+                if ($LASTEXITCODE) { $failures += "$tool command exited with $LASTEXITCODE" }
+              }
+              if ($tool -eq 'old' -and $setup) {
+                if ($observed.entries.Count -or $command) { $failures += 'Old Ruby entry or command remains available' }
+              } else {
+                if (-not $observed.entries.Count) { $failures += "$tool directory is missing from PATH: $dir" }
+                if (-not $command) { $failures += "$tool command was not found" }
+                elseif ((&$normalize (Split-Path $command.Source)) -cne (&$normalize $dir)) { $failures += "$tool resolved outside its fixture: $($command.Source)" }
+                if ($observed.output -cne $tool) { $failures += "$tool output: expected '$tool', got '$($observed.output)'" }
+              }
+            } catch { $failures += "$tool check: $($_.Exception.Message)" }
+            $observations += $observed
+          }
+          $actual = $null
+          try {
+            if (Get-Command ruby -CommandType Application -ErrorAction SilentlyContinue) {
+              $ruby = ruby -rjson -rrbconfig -e 'puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)'
+              if ($LASTEXITCODE) { throw "Ruby exited with $LASTEXITCODE" }
+              $actual = $ruby | ConvertFrom-Json
+            }
+            $expected = $env:BASELINE_RUBY | ConvertFrom-Json
+            if ($setup) {
+              if (-not $env:EXPECTED_RUBY_PREFIX) { throw 'setup-ruby did not provide a Ruby installation path' }
+              $executable = $IsWindows ? 'ruby.exe' : 'ruby'
+              $expected = @{ version = '3.4'; executable = Join-Path $env:EXPECTED_RUBY_PREFIX "bin/$executable" }
+            }
+            if ($expected) {
+              if (-not $actual) { throw 'Ruby was not found' }
+              if ((&$normalize $actual.executable) -cne (&$normalize $expected.executable)) { $failures += "Ruby interpreter: expected $($expected.executable), got $($actual.executable)" }
+              if ($setup ? $actual.version -notmatch '^3\.4\.' : $actual.version -cne $expected.version) { $failures += "Ruby version: expected $($expected.version), got $($actual.version)" }
+            } elseif ($actual) { $failures += 'Ruby appeared in the baseline without setup-ruby' }
+          } catch { $failures += "Ruby check: $($_.Exception.Message)" }
+          $record = @{ case = $case; phase = $phase; ruby = $actual; tools = $observations; failures = $failures; path = $dirs }
+          $counts = ($observations | ForEach-Object { "$($_.tool)=$($_.entries.Count)" }) -join ', '
+          $outputs = ($observations | ForEach-Object { "$($_.tool)=$($_.output ?? '(no output)')" }) -join ', '
+          $version = $actual ? $actual.version : 'not found'
+          $diagnostic = "Ruby: $version; command output: $outputs; PATH entries: $counts.`n$($record | ConvertTo-Json -Depth 8)"
+          $record | ConvertTo-Json -Depth 8 -Compress
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "diagnostic=$(ConvertTo-Json -InputObject $diagnostic -Compress)" -Encoding utf8NoBOM
+          if ($failures.Count) { "::error title=$($title)::$(&$escapeData ($failures -join "`n"))"; exit 1 }
+          "::notice title=$($title)::All functional checks passed; duplicate counts are observations."
 
-      - name: JavaScript / after setup-ruby
+      - name: JavaScript / before later PATH addition
         id: action-before
-        if: ${{ !cancelled() && steps.ruby.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
         uses: $/.github/actions/check-path
-        env: { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
+        env: *check-env
 
       - name: Add another tool for later steps
         id: add-tool
-        if: ${{ !cancelled() && steps.ruby.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           Add-Content -Path $env:GITHUB_PATH -Value $env:PATH_TEST_AFTER
@@ -119,16 +148,14 @@ jobs:
       - name: PowerShell / after later PATH addition
         id: shell-after
         if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
-        env:
-          EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}"
-          TOOLS: "inherited,before,after"
+        env: *check-env
         run: *check-path
 
       - name: JavaScript / after later PATH addition
         id: action-after
         if: ${{ !cancelled() && steps.add-tool.outcome == 'success' }}
         uses: $/.github/actions/check-path
-        env: { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
+        env: *check-env
 
       - name: Summarize PATH checks
         if: always()
@@ -136,8 +163,12 @@ jobs:
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           $steps = $env:STEPS | ConvertFrom-Json
+          $case = $env:SETUP_RUBY -eq 'true' ? 'with setup-ruby' : 'without setup-ruby (baseline)'
           $lines = @(
-            "### $env:RUNNER_OS / PATH checks: $env:JOB_STATUS"
+            "### $env:RUNNER_OS / $case / $env:JOB_STATUS"
+            ''
+            ($env:SETUP_RUBY -eq 'true' ? 'Expected: Ruby 3.4, old command removed, unrelated tools still work.' : 'Expected: original Ruby unchanged, all fixture commands still work.')
+            'Compare matching checks across both cases. Duplicate PATH entries are recorded but do not fail a check.'
             ''
             '| Check | Result | Finding |'
             '| --- | --- | --- |'
