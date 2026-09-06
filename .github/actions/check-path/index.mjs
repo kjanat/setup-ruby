@@ -8,7 +8,8 @@ const normalize = value => {
 }
 
 try {
-  const dirs = process.env.PATH.split(path.delimiter).filter(Boolean).map(normalize)
+  const entries = process.env.PATH.split(path.delimiter)
+  const dirs = entries.filter(Boolean).map(normalize)
   assert.ok(!dirs.includes(normalize(process.env.PATH_TEST_OLD)), 'Old Ruby entry remains on PATH')
   const old = process.platform === 'win32'
     ? spawnSync('where.exe', ['path-test-old'], { encoding: 'utf8' })
@@ -19,8 +20,16 @@ try {
   if (process.env.PATH_TEST_AFTER_ADDED === 'true') tools.push('after')
   for (const tool of tools) {
     const dir = process.env[`PATH_TEST_${tool.toUpperCase()}`]
-    const count = dirs.filter(entry => entry === normalize(dir)).length
-    assert.equal(count, 1, `${tool} tool entry occurs ${count} times on PATH`)
+    const matchingEntries = entries.flatMap((entry, index) =>
+      entry && normalize(entry) === normalize(dir) ? [`PATH[${index + 1}]: ${entry}`] : [])
+    if (matchingEntries.length !== 1) {
+      throw new Error([
+        `${tool} tool entry occurs ${matchingEntries.length} times on PATH (expected 1).`,
+        `Expected directory: ${dir}`,
+        'Matching PATH entries (positions start at 1):',
+        ...(matchingEntries.length ? matchingEntries : ['(none)']),
+      ].join('\n'))
+    }
     const output = execSync(`path-test-${tool}`, { encoding: 'utf8' }).trim()
     assert.equal(output, tool, `${tool} tool did not run correctly`)
   }

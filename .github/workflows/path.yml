@@ -61,9 +61,19 @@ jobs:
             if (Get-Command path-test-old -ErrorAction SilentlyContinue) { throw 'Old gem command can still be found' }
 
             foreach ($tool in $tools) {
-              $dir    = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
-              $count  = @($dirs | Where-Object { $_ -eq $dir }).Count
-              if ($count -ne 1) { throw "$tool tool entry occurs $count times on PATH" }
+              $dir = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
+              $matchingEntries = @(for ($i = 0; $i -lt $dirs.Count; $i++) {
+                if ($dirs[$i] -eq $dir) { "PATH[$($i + 1)]: $($dirs[$i])" }
+              })
+              if ($matchingEntries.Count -ne 1) {
+                $details = $matchingEntries.Count ? ($matchingEntries -join "`n") : '(none)'
+                throw (@(
+                  "$tool tool entry occurs $($matchingEntries.Count) times on PATH (expected 1)."
+                  "Expected directory: $dir"
+                  'Matching PATH entries (positions start at 1):'
+                  $details
+                ) -join "`n")
+              }
               $output = &"path-test-$tool"
               if ($LASTEXITCODE -or ($output -ne $tool)) { throw "$tool tool did not run correctly"      }
             }
