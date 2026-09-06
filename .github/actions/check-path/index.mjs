@@ -9,7 +9,7 @@ const normalize = value => {
 }
 const escapeData = value => value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')
 const phase = process.env.PATH_TEST_AFTER_ADDED === 'true' ? 'after later PATH addition' : 'after setup-ruby'
-const title = escapeData(`${process.env.RUNNER_LABEL} / JavaScript / ${phase}`)
+const title = escapeData(`${process.env.RUNNER_OS} / JavaScript / ${phase}`)
   .replaceAll(':', '%3A').replaceAll(',', '%2C')
 let diagnostic = ''
 

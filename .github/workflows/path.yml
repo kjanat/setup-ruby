@@ -9,7 +9,6 @@ jobs:
   path:
     name: PATH (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env: { RUNNER_LABEL: "${{ matrix.os }}" }
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -56,7 +55,7 @@ jobs:
         run: &check-path |
           $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
           $phase = $env:PATH_TEST_AFTER_ADDED -eq 'true' ? 'after later PATH addition' : 'after setup-ruby'
-          $title = (&$escapeData "$env:RUNNER_LABEL / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
+          $title = (&$escapeData "$env:RUNNER_OS / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
           $tools = $env:TOOLS -split ','
           $toolCounts = @()
           $diagnostic = ''
@@ -144,7 +143,7 @@ jobs:
             'action-after'  = 'JavaScript / after later PATH addition'
           }
           $lines = @(
-            "### $env:RUNNER_LABEL / PATH checks: $env:JOB_STATUS"
+            "### $env:RUNNER_OS / PATH checks: $env:JOB_STATUS"
             ''
             '| Check | Result | Finding |'
             '| --- | --- | --- |'
