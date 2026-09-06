@@ -149,21 +149,18 @@ jobs:
             '| --- | --- | --- |'
           )
           $details = @()
-          foreach ($id in $labels.Keys) {
-            $step = $steps.$id
-            $diagnostic = if ($step.outputs.diagnostic) {
-              $step.outputs.diagnostic | ConvertFrom-Json
-            } elseif ($step.outcome -eq 'skipped') {
-              'Not run.'
-            } else {
-              'No diagnostic recorded; see the step log.'
-            }
-            $parts = $diagnostic -split '\r?\n', 2
-            $finding = [Net.WebUtility]::HtmlEncode($parts[0]).Replace('|', '&#124;')
-            $lines += "| $($labels[$id]) | $($step.outcome) | $finding |"
-            if ($parts.Count -gt 1) {
-              $text = [Net.WebUtility]::HtmlEncode($diagnostic)
-              $details += @('', "<details><summary>$($labels[$id]) — details</summary>", '', "<pre>$text</pre>", '', '</details>')
+          switch -Wildcard ($labels.Keys) {
+            { $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outputs.diagnostic | ConvertFrom-Json }
+            { -not $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outcome -eq 'skipped' ? 'Not run.' : 'No diagnostic recorded; see the step log.' }
+            '*' {
+              $step = $steps.$_
+              $parts = $diagnostic -split '\r?\n', 2
+              $finding = [Net.WebUtility]::HtmlEncode($parts[0]).Replace('|', '&#124;')
+              $lines += "| $($labels[$_]) | $($step.outcome) | $finding |"
+              if ($parts.Count -gt 1) {
+                $text = [Net.WebUtility]::HtmlEncode($diagnostic)
+                $details += @('', "<details><summary>$($labels[$_]) — details</summary>", '', "<pre>$text</pre>", '', '</details>')
+              }
             }
           }
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (($lines + $details) -join "`n")
