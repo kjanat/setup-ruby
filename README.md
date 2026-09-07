@@ -142,7 +142,8 @@ The action removes existing `PATH` entries containing the word `ruby` (case-inse
 through `GITHUB_ENV`, then adds the selected Ruby through `GITHUB_PATH`. The runner combines
 both for later shell and action steps, preserving the remaining entries and searching the
 selected Ruby first. Prepending alone would still leave commands available from older Ruby
-installations when the selected version does not provide them.
+installations when the selected version does not provide them. Step log headers may omit
+the additions; inspect PATH inside the running step to see the effective value.
 
 Earlier `GITHUB_PATH` entries are reapplied by the runner, so this cleanup cannot remove them.
 When switching versions within a job, a command installed only for the earlier Ruby may still

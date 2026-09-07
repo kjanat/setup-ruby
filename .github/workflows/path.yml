@@ -7,15 +7,19 @@ permissions: { contents: read }
 defaults: { run: { shell: pwsh } }
 jobs:
   path:
-    name: PATH (${{ matrix.os }}, ${{ matrix.setup && 'with' || 'without' }} setup-ruby)
+    name: PATH (${{ matrix.os }}, ${{ matrix.experiment }}, ${{ matrix.setup && 'select Ruby 3.4' || 'keep original Ruby' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix: { os: [ubuntu-latest, macos-latest, windows-latest], setup: [false, true] }
-    env: { SETUP_RUBY: "${{ matrix.setup }}" }
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest], experiment: [single, switch], setup: [false, true] }
+    env: { SETUP_RUBY: "${{ matrix.setup }}", EXPERIMENT: "${{ matrix.experiment }}" }
     steps:
       - uses: actions/checkout@v7
+      - name: Prepare Ruby 3.3 for the version-switch comparison
+        if: matrix.experiment == 'switch'
+        uses: ./
+        with: { ruby-version: "3.3", bundler: none }
       - name: Add an old Ruby entry and unrelated tools
         id: seed
         run: |
@@ -52,6 +56,53 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV  -Value $testPath
           Add-Content -Path $env:GITHUB_PATH -Value $before
 
+      - name: Install and verify the gem command under Ruby 3.3
+        if: matrix.experiment == 'switch'
+        id: fixture
+        run: |
+          $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
+          try {
+            @'
+          require 'rubygems/package'
+          require 'rubygems/gem_runner'
+          require 'fileutils'
+          require 'tmpdir'
+          require 'rbconfig'
+          Dir.mktmpdir('path-gem-', ENV.fetch('RUNNER_TEMP')) do |dir|
+            Dir.chdir(dir) do
+              FileUtils.mkdir_p('bin')
+              File.write('bin/ruby-path-fixture', <<~RUBY)
+                #!/usr/bin/env ruby
+                require 'json'
+                require 'rbconfig'
+                puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)
+              RUBY
+              File.chmod(0755, 'bin/ruby-path-fixture')
+              spec = Gem::Specification.new do |s|
+                s.name = 'ruby-path-fixture'
+                s.version = '0.0.1'
+                s.required_ruby_version = '>= 3.3'
+                s.summary = 'Ruby command lookup fixture'
+                s.authors = ['setup-ruby contributors']
+                s.license = 'MIT'
+                s.homepage = 'https://github.com/ruby/setup-ruby'
+                s.files = ['bin/ruby-path-fixture']
+                s.executables = ['ruby-path-fixture']
+              end
+              Gem::GemRunner.new.run(['install', Gem::Package.build(spec), '--local', '--no-document', '--no-user-install', '--install-dir', Gem.dir, '--bindir', Gem.bindir])
+            end
+          end
+          '@ | ruby
+            if ($LASTEXITCODE) { throw 'Fixture gem build or installation failed' }
+            $output = ruby-path-fixture
+            if ($LASTEXITCODE) { throw 'Initial fixture execution failed' }
+            $actual = $output | ConvertFrom-Json
+            $baseline = $env:BASELINE_RUBY | ConvertFrom-Json
+            if ($actual.version -notmatch '^3\.3\.' -or $actual.version -ne $baseline.version -or $actual.executable -ne $baseline.executable) {
+              throw "Fixture must run the initial Ruby 3.3: $output"
+            }
+          } catch { "::error title=Ruby 3.3 fixture preparation::$(&$escapeData $_.Exception.Message)"; exit 1 }
+
       - uses: ./
         id: ruby
         if: matrix.setup
@@ -59,7 +110,7 @@ jobs:
 
       - name: PowerShell / before later PATH addition
         id: shell-before
-        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' && (matrix.experiment == 'single' || steps.fixture.outcome == 'success') }}
         env: &check-env { EXPECTED_RUBY_PREFIX: "${{ steps.ruby.outputs.ruby-prefix }}" }
         run: &check-path |
           $escapeData = { param([string]$s) $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
@@ -68,7 +119,7 @@ jobs:
             $IsWindows ? $s.ToLowerInvariant() : $s
           }
           $setup = $env:SETUP_RUBY -eq 'true'
-          $case = $setup ? 'with setup-ruby' : 'without setup-ruby'
+          $case = "$env:EXPERIMENT / " + ($setup ? 'select Ruby 3.4' : 'keep original Ruby')
           $phase = $env:PATH_TEST_AFTER_ADDED -eq 'true' ? 'after later PATH addition' : 'before later PATH addition'
           $title = (&$escapeData "$env:RUNNER_OS / $case / PowerShell / $phase").Replace(':', '%3A').Replace(',', '%2C')
           $dirs = $env:PATH -split [IO.Path]::PathSeparator
@@ -76,8 +127,10 @@ jobs:
           if ($env:PATH_TEST_AFTER_ADDED -eq 'true') { $tools += 'after' }
           $observations = @()
           $failures = @()
+          $checks = @()
           foreach ($tool in $tools) {
-            $observed = [ordered]@{ tool = $tool; entries = @(); command = $null; output = $null }
+            $start = $failures.Count
+            $observed = [ordered]@{ tool = $tool; entries = @(); command = $null; output = $null; exit = $null }
             try {
               $dir = [Environment]::GetEnvironmentVariable("PATH_TEST_$($tool.ToUpper())")
               $observed.entries = @(for ($i = 0; $i -lt $dirs.Count; $i++) {
@@ -89,6 +142,7 @@ jobs:
               if ($command) {
                 $observed.command = $command.Source
                 $observed.output = (& $command.Source | Out-String).Trim()
+                $observed.exit = $LASTEXITCODE
                 if ($LASTEXITCODE) { $failures += "$tool command exited with $LASTEXITCODE" }
               }
               if ($tool -eq 'old' -and $setup) {
@@ -101,15 +155,24 @@ jobs:
               }
             } catch { $failures += "$tool check: $($_.Exception.Message)" }
             $observations += $observed
+            $checks += @{
+              check = $tool
+              expected = ($tool -eq 'old' -and $setup) ? 'Not found; no matching PATH entries' : "Output '$tool'; exit 0; resolves from its fixture"
+              actual = ($observed.command ? "Output '$($observed.output)'; exit $($observed.exit)" : 'Not found') + "; $($observed.entries.Count) PATH entries"
+              result = $failures.Count -eq $start ? 'pass' : 'failure'
+            }
           }
+          $start = $failures.Count
           $actual = $null
+          $rubyExit = $null
+          $expected = $env:BASELINE_RUBY | ConvertFrom-Json
           try {
             if (Get-Command ruby -CommandType Application -ErrorAction SilentlyContinue) {
               $ruby = ruby -rjson -rrbconfig -e 'puts JSON.generate(version: RUBY_VERSION, executable: RbConfig.ruby)'
+              $rubyExit = $LASTEXITCODE
               if ($LASTEXITCODE) { throw "Ruby exited with $LASTEXITCODE" }
               $actual = $ruby | ConvertFrom-Json
             }
-            $expected = $env:BASELINE_RUBY | ConvertFrom-Json
             if ($setup) {
               if (-not $env:EXPECTED_RUBY_PREFIX) { throw 'setup-ruby did not provide a Ruby installation path' }
               $executable = $IsWindows ? 'ruby.exe' : 'ruby'
@@ -121,25 +184,55 @@ jobs:
               if ($setup ? $actual.version -notmatch '^3\.4\.' : $actual.version -cne $expected.version) { $failures += "Ruby version: expected $($expected.version), got $($actual.version)" }
             } elseif ($actual) { $failures += 'Ruby appeared in the baseline without setup-ruby' }
           } catch { $failures += "Ruby check: $($_.Exception.Message)" }
-          $record = @{ case = $case; phase = $phase; ruby = $actual; tools = $observations; failures = $failures; path = $dirs }
-          $counts = ($observations | ForEach-Object { "$($_.tool)=$($_.entries.Count)" }) -join ', '
-          $outputs = ($observations | ForEach-Object { "$($_.tool)=$($_.output ?? '(no output)')" }) -join ', '
-          $version = $actual ? $actual.version : 'not found'
-          $diagnostic = "Ruby: $version; command output: $outputs; PATH entries: $counts.`n$($record | ConvertTo-Json -Depth 8)"
-          $record | ConvertTo-Json -Depth 8 -Compress
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "diagnostic=$(ConvertTo-Json -InputObject $diagnostic -Compress)" -Encoding utf8NoBOM
+          $checks += @{
+            check = 'ruby'
+            expected = $setup ? 'Ruby 3.4 from the selected installation' : ($expected ? "Ruby $($expected.version), original interpreter" : 'Not found')
+            actual = $actual ? "$($actual | ConvertTo-Json -Compress); exit $rubyExit" : 'No Ruby result'
+            result = $failures.Count -eq $start ? 'pass' : 'failure'
+          }
+          $gem = @{ installed = $null; installedExit = $null; command = $null; output = $null; exit = $null }
+          if ($env:EXPERIMENT -eq 'switch') {
+            $start = $failures.Count
+            try {
+              $installed = ruby -rjson -e 'puts JSON.generate(Gem::Specification.find_all_by_name("ruby-path-fixture").map { |s| s.version.to_s })'
+              $gem.installedExit = $LASTEXITCODE
+              if ($LASTEXITCODE) { throw 'Could not inspect gems in the active Ruby' }
+              $gem.installed = @($installed | ConvertFrom-Json)
+              if ($setup ? $gem.installed.Count -ne 0 : '0.0.1' -notin $gem.installed) { throw "Unexpected fixture gem installation: $installed" }
+            } catch { $failures += "Gem installation check: $($_.Exception.Message)" }
+            $checks += @{ check = 'fixture gem installed'; expected = $setup ? 'Absent from Ruby 3.4' : '0.0.1 in Ruby 3.3'; actual = ConvertTo-Json -InputObject $gem.installed -Compress; result = $failures.Count -eq $start ? 'pass' : 'failure' }
+            $start = $failures.Count
+            try {
+              $command = Get-Command ruby-path-fixture -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($command) {
+                $gem.command = $command.Source
+                $gem.output = (& $command.Source | Out-String).Trim()
+                $gem.exit = $LASTEXITCODE
+                if ($gem.exit) { throw "Gem command exited with $($gem.exit): $($gem.output)" }
+                $interpreter = $gem.output | ConvertFrom-Json
+                if ($setup) { throw "Old gem command remains available after selecting Ruby 3.4: $($gem.output); command: $($gem.command)" }
+                $baseline = $env:BASELINE_RUBY | ConvertFrom-Json
+                if ($interpreter.version -ne $baseline.version -or (&$normalize $interpreter.executable) -cne (&$normalize $baseline.executable)) { throw "Gem command changed interpreter: $($gem.output)" }
+              } elseif (-not $setup) { throw 'Fixture command disappeared without a Ruby switch' }
+            } catch { $failures += "Gem command check: $($_.Exception.Message)" }
+            $checks += @{ check = 'ruby-path-fixture'; expected = $setup ? 'Not found after selecting Ruby 3.4' : 'Runs the original Ruby 3.3'; actual = $gem.command ? "$($gem.output); exit $($gem.exit)" : 'Not found'; result = $failures.Count -eq $start ? 'pass' : 'failure' }
+          }
+          $record = @{ case = $case; phase = $phase; ruby = $actual; rubyExit = $rubyExit; tools = $observations; gem = $gem; checks = $checks; failures = $failures; path = $dirs }
+          $diagnostic = $record | ConvertTo-Json -Depth 8 -Compress
+          $diagnostic
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "diagnostic=$diagnostic" -Encoding utf8NoBOM
           if ($failures.Count) { "::error title=$($title)::$(&$escapeData ($failures -join "`n"))"; exit 1 }
           "::notice title=$($title)::All functional checks passed; duplicate counts are observations."
 
       - name: JavaScript / before later PATH addition
         id: action-before
-        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' && (matrix.experiment == 'single' || steps.fixture.outcome == 'success') }}
         uses: $/.github/actions/check-path
         env: *check-env
 
       - name: Add another tool for later steps
         id: add-tool
-        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' && (matrix.experiment == 'single' || steps.fixture.outcome == 'success') }}
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           Add-Content -Path $env:GITHUB_PATH -Value $env:PATH_TEST_AFTER
@@ -163,29 +256,42 @@ jobs:
         run: |
           $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8NoBOM'
           $steps = $env:STEPS | ConvertFrom-Json
-          $case = $env:SETUP_RUBY -eq 'true' ? 'with setup-ruby' : 'without setup-ruby (baseline)'
+          $case = "$env:EXPERIMENT / " + ($env:SETUP_RUBY -eq 'true' ? 'select Ruby 3.4' : 'keep original Ruby')
+          $encode = { param($s) [Net.WebUtility]::HtmlEncode([string]$s).Replace('|', '&#124;').Replace("`r", '').Replace("`n", '<br>') }
           $lines = @(
             "### $env:RUNNER_OS / $case / $env:JOB_STATUS"
             ''
-            ($env:SETUP_RUBY -eq 'true' ? 'Expected: Ruby 3.4, old command removed, unrelated tools still work.' : 'Expected: original Ruby unchanged, all fixture commands still work.')
-            'Compare matching checks across both cases. Duplicate PATH entries are recorded but do not fail a check.'
+            'Compare matching checks across both cases. Duplicate PATH entries are observations; they do not fail a check.'
             ''
-            '| Check | Result | Finding |'
-            '| --- | --- | --- |'
+            '| Check | Expected | Actual | Result |'
+            '| --- | --- | --- | --- |'
           )
           $details = @()
-          switch -Wildcard ($steps.PSObject.Properties.Name -match '^(shell|action)-') {
-            { $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outputs.diagnostic | ConvertFrom-Json }
-            { -not $steps.$_.outputs.diagnostic } { $diagnostic = $steps.$_.outcome -eq 'skipped' ? 'Not run.' : 'No diagnostic recorded; see the step log.' }
-            '*' {
-              $step = $steps.$_
-              $parts = $diagnostic -split '\r?\n', 2
-              $finding = [Net.WebUtility]::HtmlEncode($parts[0]).Replace('|', '&#124;')
-              $lines += "| $_ | $($step.outcome) | $finding |"
-              if ($parts.Count -gt 1) {
-                $text = [Net.WebUtility]::HtmlEncode($diagnostic)
-                $details += @('', "<details><summary>$_ — details</summary>", '', "<pre>$text</pre>", '', '</details>')
+          $summaryFailures = @()
+          switch ($steps.PSObject.Properties.Name -match '^(shell|action)-') {
+            { $steps.$_.outputs.diagnostic } {
+              $id = $_
+              try {
+                $record = $steps.$_.outputs.diagnostic | ConvertFrom-Json
+                if (-not $record.checks -or @($record.checks | Where-Object { $_.result -notin @('pass', 'failure') -or -not $_.expected -or -not $_.actual }).Count) { throw 'Incomplete measurements' }
+              } catch {
+                $summaryFailures += "$id has invalid measurements"
+                $lines += "| $id | Valid measured checks | Missing or invalid data; see step log | failure |"
+                continue
               }
+              if ($steps.$_.outcome -eq 'success' -and @($record.checks | Where-Object result -eq 'failure').Count) { $summaryFailures += "$_ reported failures but exited successfully" }
+              foreach ($check in $record.checks) {
+                $lines += "| $_ / $(&$encode $check.check) | $(&$encode $check.expected) | $(&$encode $check.actual) | $(&$encode $check.result) |"
+              }
+              $text = [Net.WebUtility]::HtmlEncode(($record | ConvertTo-Json -Depth 8))
+              $details += @('', "<details><summary>$_ — measured paths and diagnostics</summary>", '', "<pre>$text</pre>", '', '</details>')
+            }
+            { -not $steps.$_.outputs.diagnostic } {
+              $reason = $steps.$_.outcome -eq 'skipped' ? 'Not run' : 'No measurements recorded; see the step log'
+              $result = $steps.$_.outcome -eq 'skipped' ? 'skipped' : 'not measured'
+              $lines += "| $_ | Checks execute and record measurements | $reason | $result |"
+              if ($steps.$_.outcome -ne 'skipped') { $summaryFailures += "$_ did not record measurements" }
             }
           }
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (($lines + $details) -join "`n")
+          if ($summaryFailures.Count) { "::error title=$env:RUNNER_OS / PATH summary::Missing or invalid measurements; see the summary and step logs."; exit 1 }
